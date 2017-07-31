@@ -25,7 +25,8 @@ var Q     = require('q'),
     shell = require('shelljs'),
     spawn = require('./spawn'),
     check_reqs = require('./check_reqs'),
-    fs = require('fs');
+    fs = require('fs'),
+    plist = require('plist');
 
 var projectPath = path.join(__dirname, '..', '..');
 var projectName = null;
@@ -62,7 +63,7 @@ module.exports.run = function (argv) {
             var buildType = args.release ? 'release' : 'debug';
             var config = buildConfig.ios[buildType];
             if(config) {
-                ['codeSignIdentity', 'codeSignResourceRules', 'provisioningProfile'].forEach( 
+                ['codeSignIdentity', 'codeSignResourceRules', 'provisioningProfile', 'packageType', 'developmentTeam'].forEach(
                     function(key) {
                         args[key] = args[key] || config[key];
                     });
@@ -99,21 +100,59 @@ module.exports.run = function (argv) {
         if (!args.device) {
             return;
         }
+
+        var exportOptions = {'compileBitcode': false, 'method': 'development'};
+
+        if (args.packageType) {
+            exportOptions.method = args.packageType;
+        }
+
+        if (args.developmentTeam) {
+            exportOptions.teamID = args.developmentTeam;
+        }
+
+        var exportOptionsPlist = plist.build(exportOptions);
+        var exportOptionsPath = path.join(projectPath, 'exportOptions.plist');
+
         var buildOutputDir = path.join(projectPath, 'build', 'device');
-        var pathToApp = path.join(buildOutputDir, projectName + '.app');
-        var pathToIpa = path.join(buildOutputDir, projectName + '.ipa');
-        var xcRunArgs = ['-sdk', 'iphoneos', 'PackageApplication', 
-            '-v', pathToApp, 
-            '-o', pathToIpa];
-        if (args.codeSignIdentity) {
-            xcRunArgs.concat('--sign', args.codeSignIdentity);
+
+        function checkSystemRuby () {
+            var ruby_cmd = shell.which('ruby');
+
+            if (ruby_cmd !== '/usr/bin/ruby') {
+                console.warn('Non-system Ruby in use. This may cause packaging to fail.\n' +
+              'If you use RVM, please run `rvm use system`.\n' +
+              'If you use chruby, please run `chruby system`.');
+            }
         }
-        if (args.provisioningProfile) {
-            xcRunArgs.concat('--embed', args.provisioningProfile);
+
+        function packageArchive () {
+            var xcodearchiveArgs = getXcodeArchiveArgs(projectName, projectPath, buildOutputDir, exportOptionsPath);
+            return spawn('xcodebuild', xcodearchiveArgs, projectPath);
         }
-        return spawn('xcrun', xcRunArgs, projectPath);
+
+        return Q.nfcall(fs.writeFile, exportOptionsPath, exportOptionsPlist, 'utf-8')
+            .then(checkSystemRuby)
+            .then(packageArchive);
     });
 };
+
+/**
+ * Returns array of arguments for xcodebuild
+ * @param  {String}  projectName        Name of xcode project
+ * @param  {String}  projectPath        Path to project file. Will be used to set CWD for xcodebuild
+ * @param  {String}  outputPath         Output directory to contain the IPA
+ * @param  {String}  exportOptionsPath  Path to the exportOptions.plist file
+ * @return {Array}                      Array of arguments that could be passed directly to spawn method
+ */
+function getXcodeArchiveArgs (projectName, projectPath, outputPath, exportOptionsPath) {
+    return [
+        '-exportArchive',
+        '-archivePath', projectName + '.xcarchive',
+        '-exportOptionsPlist', exportOptionsPath,
+        '-exportPath', outputPath
+    ];
+}
 
 /**
  * Searches for first XCode project in specified folder
@@ -125,7 +164,6 @@ function findXCodeProjectIn(projectPath) {
     var xcodeProjFiles = shell.ls(projectPath).filter(function (name) {
         return path.extname(name) === '.xcodeproj';
     });
-    
     if (xcodeProjFiles.length === 0) {
         return Q.reject('No Xcode project found in ' + projectPath);
     }
@@ -152,13 +190,17 @@ function getXcodeArgs(projectName, projectPath, configuration, isDevice) {
     var xcodebuildArgs;
     if (isDevice) {
         xcodebuildArgs = [
+            'archive',
             '-xcconfig', path.join(__dirname, '..', 'build-' + configuration.toLowerCase() + '.xcconfig'),
-            '-project', projectName + '.xcodeproj',
+            // '-project', projectName + '.xcodeproj',
             'ARCHS=armv7 armv7s arm64',
-            '-target', projectName,
+            // '-target', projectName,
+            '-workspace', projectName + '.xcodeproj/project.xcworkspace',
             '-configuration', configuration,
+            '-destination', 'generic/platform=iOS',
+            '-archivePath', projectName + '.xcarchive',
+            '-scheme', projectName,
             '-sdk', 'iphoneos',
-            'build',
             'VALID_ARCHS=armv7 armv7s arm64',
             'CONFIGURATION_BUILD_DIR=' + path.join(projectPath, 'build', 'device'),
             'SHARED_PRECOMPS_DIR=' + path.join(projectPath, 'build', 'sharedpch')
